@@ -1,0 +1,17 @@
+
+ / {
+	chosen {
+		zephyr,ipc_shm = &ipc_shm;
+	};
+
+	ipc_shm: memory@9cb00000 {
+		compatible = "mmio-sram";
+		reg = <0x9cb00000 DT_SIZE_M(1)>;
+	};
+
+	mbox-consumer {
+		compatible = "vnd,mbox-consumer";
+		mboxes = <&mbox0 0>, <&mbox0 1>;
+		mbox-names = "tx", "rx";
+	};
+};

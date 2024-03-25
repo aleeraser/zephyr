@@ -11,7 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <zephyr/drivers/ipm.h>
+#include <zephyr/drivers/mbox.h>
 
 #include <openamp/open_amp.h>
 #include <metal/sys.h>
@@ -33,24 +33,19 @@ LOG_MODULE_REGISTER(openamp_rsc_table, LOG_LEVEL_DBG);
 
 /* Constants derived from device tree */
 #define SHM_NODE		DT_CHOSEN(zephyr_ipc_shm)
-#define SHM_START_ADDR	DT_REG_ADDR(SHM_NODE)
+#define SHM_START_ADDR		DT_REG_ADDR(SHM_NODE)
 #define SHM_SIZE		DT_REG_SIZE(SHM_NODE)
 
 #define APP_TASK_STACK_SIZE (1024)
 
-/* Add 1024 extra bytes for the TTY task stack for the "tx_buff" buffer. */
-#define APP_TTY_TASK_STACK_SIZE (1536)
-
 K_THREAD_STACK_DEFINE(thread_mng_stack, APP_TASK_STACK_SIZE);
 K_THREAD_STACK_DEFINE(thread_rp__client_stack, APP_TASK_STACK_SIZE);
-K_THREAD_STACK_DEFINE(thread_tty_stack, APP_TTY_TASK_STACK_SIZE);
 
 static struct k_thread thread_mng_data;
 static struct k_thread thread_rp__client_data;
-static struct k_thread thread_tty_data;
 
-static const struct device *const ipm_handle =
-	DEVICE_DT_GET(DT_CHOSEN(zephyr_ipc));
+static const struct mbox_dt_spec mbox_dev_tx_dt = MBOX_DT_SPEC_GET(DT_PATH(mbox_consumer), tx);
+static const struct mbox_dt_spec mbox_dev_rx_dt = MBOX_DT_SPEC_GET(DT_PATH(mbox_consumer), rx);
 
 static metal_phys_addr_t shm_physmap = SHM_START_ADDR;
 
@@ -74,17 +69,14 @@ static char rx_sc_msg[20];  /* should receive "Hello world!" */
 static struct rpmsg_endpoint sc_ept;
 static struct rpmsg_rcv_msg sc_msg = {.data = rx_sc_msg};
 
-static struct rpmsg_endpoint tty_ept;
-static struct rpmsg_rcv_msg tty_msg;
 
 static K_SEM_DEFINE(data_sem, 0, 1);
 static K_SEM_DEFINE(data_sc_sem, 0, 1);
-static K_SEM_DEFINE(data_tty_sem, 0, 1);
 
-static void platform_ipm_callback(const struct device *dev, void *context,
-				  uint32_t id, volatile void *data)
+static void platform_mbox_callback(const struct device *dev, uint32_t channel,
+				  void *user_data, struct mbox_msg *msg)
 {
-	LOG_DBG("%s: msg received from mb %d", __func__, id);
+	LOG_DBG("msg received from channel %d, size: %d, content: %x", channel, msg->size, *(uint32_t *)msg->data);
 	k_sem_give(&data_sem);
 }
 
@@ -94,19 +86,6 @@ static int rpmsg_recv_cs_callback(struct rpmsg_endpoint *ept, void *data,
 	memcpy(sc_msg.data, data, len);
 	sc_msg.len = len;
 	k_sem_give(&data_sc_sem);
-
-	return RPMSG_SUCCESS;
-}
-
-static int rpmsg_recv_tty_callback(struct rpmsg_endpoint *ept, void *data,
-				   size_t len, uint32_t src, void *priv)
-{
-	struct rpmsg_rcv_msg *msg = priv;
-
-	rpmsg_hold_rx_buffer(ept, data);
-	msg->data = data;
-	msg->len = len;
-	k_sem_give(&data_tty_sem);
 
 	return RPMSG_SUCCESS;
 }
@@ -132,7 +111,7 @@ int mailbox_notify(void *priv, uint32_t id)
 	ARG_UNUSED(priv);
 
 	LOG_DBG("%s: msg received", __func__);
-	ipm_send(ipm_handle, 0, id, NULL, 0);
+	mbox_send(mbox_dev_tx_dt.dev, mbox_dev_tx_dt.channel_id, NULL);
 
 	return 0;
 }
@@ -153,25 +132,36 @@ int platform_init(void)
 	/* declare shared memory region */
 	metal_io_init(shm_io, (void *)SHM_START_ADDR, &shm_physmap,
 		      SHM_SIZE, -1, 0, NULL);
+	LOG_DBG("SHM_START_ADDR: 0x%llx, SHM_SIZE: %u kB", SHM_START_ADDR, SHM_SIZE);
 
 	/* declare resource table region */
 	rsc_table_get(&rsc_tab_addr, &rsc_size);
 	rsc_table = (struct st_resource_table *)rsc_tab_addr;
 
+	LOG_DBG("rsc_tab_addr: %p, rsc_size: %u kB", rsc_tab_addr, rsc_size);
+
 	metal_io_init(rsc_io, rsc_table,
 		      (metal_phys_addr_t *)rsc_table, rsc_size, -1, 0, NULL);
 
-	/* setup IPM */
-	if (!device_is_ready(ipm_handle)) {
-		LOG_ERR("IPM device is not ready");
+	/* setup MBOX device */
+	if (!device_is_ready(mbox_dev_tx_dt.dev) || !device_is_ready(mbox_dev_rx_dt.dev)) {
+		LOG_ERR("MBOX device is not ready\n");
 		return -1;
 	}
 
-	ipm_register_callback(ipm_handle, platform_ipm_callback, NULL);
+	// TODO tx callback not used atm
+	// mbox_register_callback(mbox_dev_tx_dt.dev, mbox_dev_tx_dt.channel_id, platform_mbox_callback, NULL);
+	status = mbox_register_callback(mbox_dev_rx_dt.dev, mbox_dev_rx_dt.channel_id, platform_mbox_callback, NULL);
+	if (status < 0) {
+		LOG_ERR("Could not register callback (%d)\n", status);
+		return -1;
+	}
 
-	status = ipm_set_enabled(ipm_handle, 1);
+	// TODO tx irq not used atm
+	// status = mbox_set_enabled(mbox_dev_tx_dt.dev, mbox_dev_tx_dt.channel_id, 1);
+	status = mbox_set_enabled(mbox_dev_rx_dt.dev, mbox_dev_rx_dt.channel_id, 1);
 	if (status) {
-		LOG_ERR("ipm_set_enabled failed");
+		LOG_ERR("mbox_set_enabled failed (%d)", status);
 		return -1;
 	}
 
@@ -180,7 +170,9 @@ int platform_init(void)
 
 static void cleanup_system(void)
 {
-	ipm_set_enabled(ipm_handle, 0);
+	// TODO tx irq not used atm
+	// mbox_set_enabled(mbox_dev_tx_dt.dev, mbox_dev_tx_dt.channel_id, 0);
+	mbox_set_enabled(mbox_dev_rx_dt.dev, mbox_dev_rx_dt.channel_id, 0);
 	rpmsg_deinit_vdev(&rvdev);
 	metal_finish();
 }
@@ -273,47 +265,6 @@ task_end:
 	LOG_INF("OpenAMP Linux sample client responder ended");
 }
 
-void app_rpmsg_tty(void *arg1, void *arg2, void *arg3)
-{
-	ARG_UNUSED(arg1);
-	ARG_UNUSED(arg2);
-	ARG_UNUSED(arg3);
-
-	unsigned char tx_buff[512];
-	int ret = 0;
-
-	k_sem_take(&data_tty_sem,  K_FOREVER);
-
-	LOG_INF("OpenAMP[remote] Linux TTY responder started");
-
-	tty_ept.priv = &tty_msg;
-	ret = rpmsg_create_ept(&tty_ept, rpdev, "rpmsg-tty",
-			       RPMSG_ADDR_ANY, RPMSG_ADDR_ANY,
-			       rpmsg_recv_tty_callback, NULL);
-	if (ret) {
-		LOG_ERR("[Linux TTY] Could not create endpoint: %d", ret);
-		goto task_end;
-	}
-
-	while (tty_ept.addr !=  RPMSG_ADDR_ANY) {
-		k_sem_take(&data_tty_sem,  K_FOREVER);
-		if (tty_msg.len) {
-			LOG_INF("[Linux TTY] incoming msg: %.*s",
-				tty_msg.len, (char *)tty_msg.data);
-			snprintf(tx_buff, 13, "TTY 0x%04x: ", tty_ept.addr);
-			memcpy(&tx_buff[12], tty_msg.data, tty_msg.len);
-			rpmsg_send(&tty_ept, tx_buff, tty_msg.len + 12);
-			rpmsg_release_rx_buffer(&tty_ept, tty_msg.data);
-		}
-		tty_msg.len = 0;
-		tty_msg.data = NULL;
-	}
-	rpmsg_destroy_ept(&tty_ept);
-
-task_end:
-	LOG_INF("OpenAMP Linux TTY responder ended");
-}
-
 void rpmsg_mng_task(void *arg1, void *arg2, void *arg3)
 {
 	ARG_UNUSED(arg1);
@@ -342,13 +293,12 @@ void rpmsg_mng_task(void *arg1, void *arg2, void *arg3)
 		goto task_end;
 	}
 
-#ifdef CONFIG_SHELL_BACKEND_RPMSG
-	(void)shell_backend_rpmsg_init_transport(rpdev);
-#endif
+// #ifdef CONFIG_SHELL_BACKEND_RPMSG
+// 	(void)shell_backend_rpmsg_init_transport(rpdev);
+// #endif
 
 	/* start the rpmsg clients */
 	k_sem_give(&data_sc_sem);
-	k_sem_give(&data_tty_sem);
 
 	while (1) {
 		receive_message(&msg, &len);
@@ -362,15 +312,13 @@ task_end:
 
 int main(void)
 {
+	LOG_DBG("Hello Zephyr MBOX! board: %s, build time: %s%s", CONFIG_BOARD_TARGET, __DATE__, __TIME__);
 	LOG_INF("Starting application threads!");
 	k_thread_create(&thread_mng_data, thread_mng_stack, APP_TASK_STACK_SIZE,
 			rpmsg_mng_task,
 			NULL, NULL, NULL, K_PRIO_COOP(8), 0, K_NO_WAIT);
 	k_thread_create(&thread_rp__client_data, thread_rp__client_stack, APP_TASK_STACK_SIZE,
 			app_rpmsg_client_sample,
-			NULL, NULL, NULL, K_PRIO_COOP(7), 0, K_NO_WAIT);
-	k_thread_create(&thread_tty_data, thread_tty_stack, APP_TTY_TASK_STACK_SIZE,
-			app_rpmsg_tty,
 			NULL, NULL, NULL, K_PRIO_COOP(7), 0, K_NO_WAIT);
 	return 0;
 }
