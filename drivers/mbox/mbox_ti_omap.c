@@ -6,14 +6,12 @@
 
 #define DT_DRV_COMPAT ti_omap_mailbox
 
-#include <zephyr/devicetree.h>
 #include <zephyr/drivers/mbox.h>
 #include <zephyr/irq.h>
-#include <zephyr/sys/util_macro.h>
 
 #define LOG_LEVEL CONFIG_MBOX_LOG_LEVEL
 #include <zephyr/logging/log.h>
-LOG_MODULE_REGISTER(ti_omap_mailbox);
+LOG_MODULE_REGISTER(ti_omap_mailbox, LOG_LEVEL_DBG);
 
 /* Helper Macros for MBOX */
 #define DEV_CFG(dev)	((const struct omap_mailbox_config *)((dev)->config))
@@ -146,14 +144,26 @@ static int omap_mailbox_set_enabled(const struct device *dev, uint32_t channel, 
 	volatile struct omap_mailbox_regs *regs = DEV_BASE(data);
 	uint32_t irqstatus;
 
-	if (channel >= MAILBOX_MAX_CHANNELS)
+	if (channel >= MAILBOX_MAX_CHANNELS) {
+		LOG_ERR("invalid channel");
 		return -EINVAL;
+	}
 
-	if (enable && data->channel_enable[channel])
+	if (enable && data->channel_enable[channel]) {
+		LOG_ERR("channel already enabled");
 		return -EALREADY;
+	}
+
+	// TODO upstream this check
+	if (enable && (data->cb[channel] == NULL)) {
+		LOG_WRN("Enabling channel without a registered callback");
+	}
+
+	LOG_DBG("conf->user: %u, channel: %u, enable: %d", cfg->usr_id, channel, enable);
 
 	irqstatus = regs->irq_regs[cfg->usr_id].enable_set;
-	irqstatus |= MAILBOX_IRQ_NEWMSG(channel);
+	irqstatus |= MAILBOX_IRQ_NEWMSG(channel); // FIXME does this handle disable?
+	LOG_DBG("irqstatus: %u", irqstatus);
 	regs->irq_regs[cfg->usr_id].enable_set = irqstatus;
 	data->channel_enable[channel] = enable;
 
